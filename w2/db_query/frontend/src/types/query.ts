@@ -28,3 +28,6 @@ export interface QueryHistoryEntry {
   errorMessage?: string | null;
   querySource: "manual" | "natural_language";
 }
+
+/** Supported export formats for query results. */
+export type ExportFormat = "csv" | "json";

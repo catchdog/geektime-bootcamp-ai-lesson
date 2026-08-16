@@ -9,28 +9,33 @@ import {
   Space,
   Table,
   message,
+  notification,
   Row,
   Col,
   Typography,
   Empty,
   Tabs,
-  Modal,
 } from "antd";
 import {
   PlayCircleOutlined,
   SearchOutlined,
   DatabaseOutlined,
   ReloadOutlined,
-  ExclamationCircleOutlined,
+  DownloadOutlined,
+  FileTextOutlined,
 } from "@ant-design/icons";
 import { apiClient } from "../services/api";
 import { DatabaseMetadata, TableMetadata } from "../types/metadata";
+import { ExportFormat } from "../types/query";
 import { MetadataTree } from "../components/MetadataTree";
 import { SqlEditor } from "../components/SqlEditor";
 import { DatabaseSidebar } from "../components/DatabaseSidebar";
 import { NaturalLanguageInput } from "../components/NaturalLanguageInput";
 
 const { Title, Text } = Typography;
+
+/** Notification key reused for the post-query export prompt. */
+const EXPORT_PROMPT_KEY = "export-prompt";
 
 interface QueryResult {
   columns: Array<{ name: string; dataType: string }>;
@@ -51,6 +56,9 @@ export const Home: React.FC = () => {
   const [activeTab, setActiveTab] = useState<"manual" | "natural">("manual");
   const [generatingSql, setGeneratingSql] = useState(false);
   const [nlError, setNlError] = useState<string | null>(null);
+  const [exporting, setExporting] = useState<ExportFormat | null>(null);
+  // Hook-based notification instance supports destroy(key), unlike the static API
+  const [notificationApi, notificationContextHolder] = notification.useNotification();
 
   useEffect(() => {
     if (selectedDatabase) {
@@ -82,6 +90,7 @@ export const Home: React.FC = () => {
     }
 
     setExecuting(true);
+    notificationApi.destroy(EXPORT_PROMPT_KEY);
     try {
       const response = await apiClient.post<QueryResult>(
         `/api/v1/dbs/${selectedDatabase}/query`,
@@ -91,6 +100,10 @@ export const Home: React.FC = () => {
       message.success(
         `Query executed - ${response.data.rowCount} rows in ${response.data.executionTimeMs}ms`
       );
+      // Proactively offer to export the fresh result
+      if (response.data.rowCount > 0) {
+        promptExport(response.data.rowCount);
+      }
     } catch (error: any) {
       message.error(error.response?.data?.detail || "Query execution failed");
       setQueryResult(null);
@@ -136,89 +149,101 @@ export const Home: React.FC = () => {
     }
   };
 
-  const handleExportCSV = () => {
-    if (!queryResult || queryResult.rows.length === 0) {
-      message.warning("No data to export");
+  /**
+   * Download the current query result as a CSV or JSON file.
+   * The backend re-executes the SQL through the export endpoint, so the file
+   * is encoded (BOM for Excel), named and audited server-side.
+   */
+  const handleExport = async (format: ExportFormat) => {
+    if (!selectedDatabase || !sql.trim()) {
+      message.warning("Please enter a SQL query");
       return;
     }
 
-    // Warn if result is large
-    if (queryResult.rows.length > 10000) {
-      Modal.confirm({
-        title: "Large Dataset Warning",
-        icon: <ExclamationCircleOutlined />,
-        content: `You are about to export ${queryResult.rowCount.toLocaleString()} rows. This may take a while and consume memory. Continue?`,
-        onOk: () => exportToCSV(),
-      });
-    } else {
-      exportToCSV();
-    }
-  };
-
-  const exportToCSV = () => {
-    if (!queryResult) return;
-
-    // Generate CSV content
-    const headers = queryResult.columns.map((col) => col.name);
-    const csvRows = [headers.join(",")];
-
-    queryResult.rows.forEach((row) => {
-      const values = headers.map((header) => {
-        const value = row[header];
-        // Handle null/undefined
-        if (value === null || value === undefined) return "";
-        // Escape quotes and wrap in quotes if contains comma or quote
-        const stringValue = String(value);
-        if (stringValue.includes(",") || stringValue.includes('"') || stringValue.includes("\n")) {
-          return `"${stringValue.replace(/"/g, '""')}"`;
+    setExporting(format);
+    try {
+      const response = await apiClient.post(
+        `/api/v1/dbs/${selectedDatabase}/query/export`,
+        { sql: sql.trim() },
+        {
+          params: { format },
+          responseType: "blob",
         }
-        return stringValue;
-      });
-      csvRows.push(values.join(","));
+      );
+
+      // Prefer the filename proposed by the server, fall back to a local one
+      const disposition: string = response.headers?.["content-disposition"] || "";
+      const match = disposition.match(/filename\*=UTF-8''([^;]+)/) ||
+        disposition.match(/filename="?([^";]+)"?/);
+      const filename = match?.[1]
+        ? decodeURIComponent(match[1])
+        : `${selectedDatabase}_${Date.now()}.${format}`;
+
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      window.URL.revokeObjectURL(url);
+
+      notificationApi.destroy(EXPORT_PROMPT_KEY);
+      message.success(`Exported to ${filename}`);
+    } catch (err: any) {
+      // Errors arrive as a blob, so surface the server detail when parseable
+      let errorMessage = "Export failed";
+      if (err.response?.data instanceof Blob) {
+        try {
+          const text = await err.response.data.text();
+          const parsed = JSON.parse(text);
+          errorMessage = parsed?.detail || errorMessage;
+        } catch {
+          /* keep default message */
+        }
+      } else {
+        errorMessage = err.response?.data?.detail || err.message || errorMessage;
+      }
+      message.error(errorMessage);
+    } finally {
+      setExporting(null);
+    }
+  };
+
+  /** Proactively ask the user whether to export the fresh query result. */
+  const promptExport = (rowCount: number) => {
+    notificationApi.open({
+      key: EXPORT_PROMPT_KEY,
+      message: "Query executed successfully",
+      description: `${rowCount} rows returned. Export this result as a CSV or JSON file?`,
+      icon: <DownloadOutlined style={{ color: "#16AA98" }} />,
+      btn: (
+        <Space>
+          <Button size="small" onClick={() => notificationApi.destroy(EXPORT_PROMPT_KEY)}>
+            Not now
+          </Button>
+          <Button
+            size="small"
+            icon={<FileTextOutlined />}
+            loading={exporting === "csv"}
+            onClick={() => handleExport("csv")}
+          >
+            Export CSV
+          </Button>
+          <Button
+            size="small"
+            type="primary"
+            icon={<DownloadOutlined />}
+            loading={exporting === "json"}
+            onClick={() => handleExport("json")}
+          >
+            Export JSON
+          </Button>
+        </Space>
+      ),
+      duration: null,
+      placement: "bottomRight",
     });
-
-    const csvContent = csvRows.join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const link = document.createElement("a");
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
-    link.href = URL.createObjectURL(blob);
-    link.download = `${selectedDatabase}_${timestamp}.csv`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-    message.success(`Exported ${queryResult.rowCount} rows to CSV`);
-  };
-
-  const handleExportJSON = () => {
-    if (!queryResult || queryResult.rows.length === 0) {
-      message.warning("No data to export");
-      return;
-    }
-
-    // Warn if result is large
-    if (queryResult.rows.length > 10000) {
-      Modal.confirm({
-        title: "Large Dataset Warning",
-        icon: <ExclamationCircleOutlined />,
-        content: `You are about to export ${queryResult.rowCount.toLocaleString()} rows. This may take a while and consume memory. Continue?`,
-        onOk: () => exportToJSON(),
-      });
-    } else {
-      exportToJSON();
-    }
-  };
-
-  const exportToJSON = () => {
-    if (!queryResult) return;
-
-    const jsonContent = JSON.stringify(queryResult.rows, null, 2);
-    const blob = new Blob([jsonContent], { type: "application/json;charset=utf-8;" });
-    const link = document.createElement("a");
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5);
-    link.href = URL.createObjectURL(blob);
-    link.download = `${selectedDatabase}_${timestamp}.json`;
-    link.click();
-    URL.revokeObjectURL(link.href);
-    message.success(`Exported ${queryResult.rowCount} rows to JSON`);
   };
 
   const tableColumns =
@@ -233,6 +258,7 @@ export const Home: React.FC = () => {
   if (!selectedDatabase) {
     return (
       <div style={{ display: "flex", height: "100vh" }}>
+        {notificationContextHolder}
         <DatabaseSidebar
           selectedDatabase={selectedDatabase}
           onSelectDatabase={setSelectedDatabase}
@@ -269,6 +295,7 @@ export const Home: React.FC = () => {
   if (loading) {
     return (
       <div style={{ display: "flex", height: "100vh" }}>
+        {notificationContextHolder}
         <DatabaseSidebar
           selectedDatabase={selectedDatabase}
           onSelectDatabase={setSelectedDatabase}
@@ -295,6 +322,7 @@ export const Home: React.FC = () => {
 
   return (
     <div style={{ display: "flex", height: "100vh", background: "#F4EFEA" }}>
+      {notificationContextHolder}
       {/* Database List Sidebar */}
       <DatabaseSidebar
         selectedDatabase={selectedDatabase}
@@ -626,14 +654,18 @@ export const Home: React.FC = () => {
               <Space size={8}>
                 <Button
                   size="small"
-                  onClick={handleExportCSV}
+                  icon={<FileTextOutlined />}
+                  loading={exporting === "csv"}
+                  onClick={() => handleExport("csv")}
                   style={{ fontSize: 12, fontWeight: 700 }}
                 >
                   EXPORT CSV
                 </Button>
                 <Button
                   size="small"
-                  onClick={handleExportJSON}
+                  icon={<DownloadOutlined />}
+                  loading={exporting === "json"}
+                  onClick={() => handleExport("json")}
                   style={{ fontSize: 12, fontWeight: 700 }}
                 >
                   EXPORT JSON

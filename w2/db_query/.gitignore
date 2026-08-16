@@ -1,0 +1,14 @@
+# Exports contain real query results — never commit them
+exports/
+
+# Claude Code local artifacts
+.claude/settings.local.json
+
+# Node
+node_modules/
+dist/
+
+# Python
+__pycache__/
+*.pyc
+.venv/

@@ -87,10 +87,21 @@ class DatabaseAdapterRegistry:
         # Use connection name and type as cache key
         cache_key = f"{db_type.value}:{config.name}"
 
-        if cache_key not in self._instances:
-            adapter_class = self._adapters[db_type]
-            self._instances[cache_key] = adapter_class(config)
-            logger.info(f"Created new {adapter_class.__name__} instance for {config.name}")
+        cached = self._instances.get(cache_key)
+        if cached is not None:
+            if cached.config.url == config.url:
+                return cached
+            # URL changed (e.g. connection updated): the cached instance would
+            # keep connecting with stale credentials, so replace it. Its pool,
+            # if one was ever opened, is left to be reaped on shutdown — this
+            # path only triggers on low-frequency config updates.
+            logger.info(
+                f"URL changed for '{config.name}', recreating adapter instance"
+            )
+
+        adapter_class = self._adapters[db_type]
+        self._instances[cache_key] = adapter_class(config)
+        logger.info(f"Created new {adapter_class.__name__} instance for {config.name}")
 
         return self._instances[cache_key]
 

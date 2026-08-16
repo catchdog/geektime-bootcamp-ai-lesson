@@ -1,7 +1,9 @@
 """Query execution API endpoints."""
 
 import json
-from fastapi import APIRouter, Depends, HTTPException, status
+from datetime import datetime
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
 from sqlmodel import Session, select
 from typing import List
 from app.database import get_session
@@ -17,6 +19,13 @@ from app.models.schemas import (
 from app.services.query_wrapper import execute_query_with_service
 from app.services.query import get_query_history
 from app.services.sql_validator import SqlValidationError
+from app.services.export import (
+    EXPORT_MEDIA_TYPES,
+    ExportFormat,
+    build_content_disposition,
+    build_export_filename,
+    export_result,
+)
 from app.services.nl2sql import nl2sql_service
 from app.services.metadata import get_cached_metadata
 
@@ -122,6 +131,79 @@ async def get_query_history_for_database(
     # Get history
     history_list = await get_query_history(session, name, limit)
     return [to_history_entry(h) for h in history_list]
+
+
+@router.post("/{name}/query/export")
+async def export_sql_query_result(
+    name: str,
+    input_data: QueryInput,
+    session: Session = Depends(get_session),
+    export_format: ExportFormat = Query(
+        default=ExportFormat.CSV,
+        alias="format",
+        description="Export format: csv or json",
+    ),
+) -> Response:
+    """
+    Execute a SQL query and return the result as a downloadable file.
+
+    The query is executed through the same validation / history pipeline as
+    POST /{name}/query, so exported queries also land in the query history.
+
+    Args:
+        name: Database connection name
+        input_data: Query input with SQL
+        session: Database session
+        export_format: Target file format (csv or json)
+
+    Returns:
+        File download response (Content-Disposition: attachment)
+    """
+    # Get connection
+    statement = select(DatabaseConnection).where(
+        DatabaseConnection.name == name
+    )
+    connection = session.exec(statement).first()
+
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Database connection '{name}' not found",
+        )
+
+    # Execute query (reuses the standard pipeline: validation + history)
+    try:
+        result = await execute_query_with_service(
+            session,
+            name,
+            connection.db_type,
+            connection.url,
+            input_data.sql,
+            QuerySource.MANUAL,
+        )
+    except SqlValidationError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e),
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Query execution failed: {str(e)}",
+        )
+
+    # Build downloadable response
+    filename = build_export_filename(name, export_format, datetime.now())
+    content = export_result(result, export_format)
+    return Response(
+        content=content.encode(
+            "utf-8-sig" if export_format == ExportFormat.CSV else "utf-8"
+        ),
+        media_type=EXPORT_MEDIA_TYPES[export_format],
+        headers={
+            "Content-Disposition": build_content_disposition(filename),
+        },
+    )
 
 
 @router.post("/{name}/query/natural", response_model=GeneratedSqlResponse)
