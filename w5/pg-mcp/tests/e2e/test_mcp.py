@@ -2,11 +2,41 @@
 
 This module provides E2E tests for the FastMCP server implementation,
 testing the complete query flow through the MCP protocol.
+
+These tests require a live PostgreSQL database and a real OpenAI API key.
+They are marked as ``integration`` and skipped automatically when the
+required environment is not configured, so the default unit suite
+(``pytest -m "not integration"``) stays green without external services.
 """
+
+import os
 
 import pytest
 
 from pg_mcp.server import lifespan, mcp, query
+
+
+def _live_services_available() -> bool:
+    """Whether a reachable PostgreSQL and an OpenAI key are configured."""
+    has_openai = bool(os.environ.get("OPENAI_API_KEY", "").startswith("sk-"))
+    has_db = bool(
+        os.environ.get("DATABASE_HOST")
+        or os.environ.get("DATABASE_NAME")
+        or os.environ.get("DATABASES")
+    )
+    return has_openai and has_db
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not _live_services_available(),
+        reason=(
+            "requires live PostgreSQL and OpenAI credentials "
+            "(set DATABASE_*/DATABASES and OPENAI_API_KEY)"
+        ),
+    ),
+]
 
 
 class TestMCPServer:
@@ -30,14 +60,10 @@ class TestMCPServer:
                 return_type="sql",
             )
 
-            # Verify response structure
-            assert "success" in result
-            assert "generated_sql" in result or "error" in result
-
-            # If successful, verify SQL is returned
-            if result.get("success"):
-                assert result["generated_sql"] is not None
-                assert isinstance(result["generated_sql"], str)
+            # With live services the SQL-only path must succeed
+            assert result["success"] is True, f"unexpected error: {result.get('error')}"
+            assert result["generated_sql"] is not None
+            assert isinstance(result["generated_sql"], str)
 
     @pytest.mark.asyncio
     async def test_query_tool_with_execution(self):
@@ -48,15 +74,11 @@ class TestMCPServer:
                 return_type="result",
             )
 
-            # Verify response structure
-            assert "success" in result
-
-            # If successful, verify data is returned
-            if result.get("success"):
-                assert "data" in result
-                assert result["data"] is not None
-                assert "rows" in result["data"]
-                assert "columns" in result["data"]
+            # With live services the full flow must succeed
+            assert result["success"] is True, f"unexpected error: {result.get('error')}"
+            assert result["data"] is not None
+            assert "rows" in result["data"]
+            assert "columns" in result["data"]
 
     @pytest.mark.asyncio
     async def test_query_tool_invalid_return_type(self):

@@ -156,10 +156,18 @@ class SQLValidator:
             if cmd_name == "EXPLAIN":
                 if not self.allow_explain:
                     raise SecurityViolationError("EXPLAIN statements are not allowed")
-                # EXPLAIN is read-only and safe - it only shows query plans without executing.
-                # sqlglot 28.5.0 cannot parse EXPLAIN syntax reliably (falls back to Command),
-                # so we don't attempt to validate the inner query string to avoid false positives.
-                # Even "EXPLAIN DELETE" is safe as it won't actually delete data.
+                # EXPLAIN ANALYZE actually executes the inner statement to
+                # produce real timings, so it must stay blocked even when
+                # plain EXPLAIN is allowed.
+                cmd_text = f"{statement.this} {statement.expression or ''}".upper()
+                if "ANALYZE" in cmd_text or "ANALYSE" in cmd_text:
+                    raise SecurityViolationError(
+                        "EXPLAIN ANALYZE statements are not allowed"
+                    )
+                # Plain EXPLAIN is read-only and safe - it only shows query
+                # plans without executing. sqlglot 28.5.0 cannot parse EXPLAIN
+                # syntax reliably (falls back to Command), so we don't attempt
+                # to validate the inner query string to avoid false positives.
                 return None
             else:
                 # Other commands are not allowed
@@ -193,7 +201,7 @@ class SQLValidator:
         if error := self._check_subquery_safety(statement):
             raise SecurityViolationError(error)
 
-    def _check_statement_type(self, statement: exp.Expression) -> str | None:
+    def _check_statement_type(self, statement: exp.Expr) -> str | None:
         """Check if statement type is allowed.
 
         Args:
@@ -215,7 +223,7 @@ class SQLValidator:
 
         return None
 
-    def _check_dangerous_functions(self, statement: exp.Expression) -> str | None:
+    def _check_dangerous_functions(self, statement: exp.Expr) -> str | None:
         """Check for use of blocked/dangerous functions.
 
         Args:
@@ -233,7 +241,7 @@ class SQLValidator:
 
         return None
 
-    def _check_blocked_tables(self, statement: exp.Expression) -> str | None:
+    def _check_blocked_tables(self, statement: exp.Expr) -> str | None:
         """Check for access to blocked tables.
 
         Args:
@@ -254,7 +262,7 @@ class SQLValidator:
 
         return None
 
-    def _check_blocked_columns(self, statement: exp.Expression) -> str | None:
+    def _check_blocked_columns(self, statement: exp.Expr) -> str | None:
         """Check for access to blocked columns.
 
         Args:
@@ -282,7 +290,7 @@ class SQLValidator:
 
         return None
 
-    def _check_subquery_safety(self, statement: exp.Expression) -> str | None:
+    def _check_subquery_safety(self, statement: exp.Expr) -> str | None:
         """Check that all subqueries only contain SELECT statements.
 
         Args:

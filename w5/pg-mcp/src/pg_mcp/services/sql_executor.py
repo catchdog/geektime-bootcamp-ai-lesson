@@ -7,14 +7,25 @@ result serialization, and row limiting to prevent memory overflow.
 import asyncio
 import datetime
 import decimal
+import time
 import uuid
 from typing import Any
 
 import asyncpg
 from asyncpg import Connection, Pool
 
-from pg_mcp.config.settings import DatabaseConfig, SecurityConfig
+from pg_mcp.config.settings import DatabaseConfig, ResilienceConfig, SecurityConfig
 from pg_mcp.models.errors import DatabaseError, ExecutionTimeoutError
+from pg_mcp.observability.metrics import metrics
+from pg_mcp.resilience.retry import async_retry
+
+# Transient database/connection errors eligible for retry with backoff
+TRANSIENT_DB_ERRORS: tuple[type[BaseException], ...] = (
+    asyncpg.exceptions.ConnectionDoesNotExistError,
+    asyncpg.exceptions.ConnectionFailureError,
+    asyncpg.InterfaceError,
+    OSError,
+)
 
 
 class SQLExecutor:
@@ -37,6 +48,7 @@ class SQLExecutor:
         pool: Pool,
         security_config: SecurityConfig,
         db_config: DatabaseConfig,
+        resilience_config: ResilienceConfig | None = None,
     ) -> None:
         """Initialize SQL executor.
 
@@ -44,10 +56,13 @@ class SQLExecutor:
             pool: asyncpg connection pool for database connections.
             security_config: Security configuration including timeouts and limits.
             db_config: Database configuration including connection parameters.
+            resilience_config: Optional resilience configuration enabling
+                retries for transient database errors.
         """
         self.pool = pool
         self.security_config = security_config
         self.db_config = db_config
+        self.resilience_config = resilience_config
 
     async def execute(
         self,
@@ -64,6 +79,10 @@ class SQLExecutor:
         4. Executes the query with timeout
         5. Limits the number of returned rows
         6. Serializes special PostgreSQL types
+
+        Transient connection errors are retried with exponential backoff
+        (up to ``resilience_config.db_retry_attempts`` times) when a
+        resilience configuration was provided.
 
         Args:
             sql: SQL query to execute (should already be validated).
@@ -91,6 +110,38 @@ class SQLExecutor:
         timeout = timeout or self.security_config.max_execution_time
         max_rows = max_rows or self.security_config.max_rows
 
+        if self.resilience_config is not None and self.resilience_config.db_retry_attempts > 0:
+            # Retry the whole acquire/execute block so a fresh connection is
+            # used when a transient connection error occurs.
+            return await async_retry(
+                lambda: self._execute_once(sql, timeout, max_rows),
+                retries=self.resilience_config.db_retry_attempts,
+                delay=self.resilience_config.retry_delay,
+                backoff_factor=self.resilience_config.backoff_factor,
+                retry_on=TRANSIENT_DB_ERRORS,
+            )
+        return await self._execute_once(sql, timeout, max_rows)
+
+    async def _execute_once(
+        self,
+        sql: str,
+        timeout: float,  # noqa: ASYNC109
+        max_rows: int,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Execute the query a single time (no retries).
+
+        Args:
+            sql: SQL query to execute.
+            timeout: Query timeout in seconds.
+            max_rows: Maximum rows to return.
+
+        Returns:
+            tuple: (results, total_row_count).
+
+        Raises:
+            ExecutionTimeoutError: If query execution exceeds timeout.
+            DatabaseError: If database operation fails.
+        """
         try:
             async with (
                 self.pool.acquire() as connection,
@@ -100,6 +151,7 @@ class SQLExecutor:
                 await self._set_session_params(connection, timeout)
 
                 # Execute query with timeout
+                fetch_started = time.monotonic()
                 try:
                     records = await asyncio.wait_for(
                         connection.fetch(sql),
@@ -113,6 +165,8 @@ class SQLExecutor:
                             "sql": sql[:200],  # Include truncated SQL for debugging
                         },
                     ) from e
+                finally:
+                    metrics.observe_db_query_duration(time.monotonic() - fetch_started)
 
                 # Track total count before limiting
                 total_count = len(records)

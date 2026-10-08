@@ -5,8 +5,12 @@ of the query processing pipeline: SQL generation, validation, execution, and res
 validation. It implements retry logic, error handling, and request tracking.
 """
 
+import asyncio
+import contextlib
 import logging
-import uuid
+import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from asyncpg import Pool
@@ -14,10 +18,12 @@ from asyncpg import Pool
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import ResilienceConfig, ValidationConfig
 from pg_mcp.models.errors import (
+    DatabaseConnectionError,
     DatabaseError,
     ErrorCode,
     LLMError,
     PgMcpError,
+    RateLimitExceededError,
     SchemaLoadError,
     SecurityViolationError,
     SQLParseError,
@@ -27,10 +33,18 @@ from pg_mcp.models.query import (
     QueryRequest,
     QueryResponse,
     QueryResult,
+    ResultValidationResult,
     ReturnType,
     ValidationResult,
 )
+from pg_mcp.observability.metrics import metrics
+from pg_mcp.observability.tracing import (
+    bind_request_id,
+    generate_request_id,
+    unbind_request_id,
+)
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker
+from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.result_validator import ResultValidator
 from pg_mcp.services.sql_executor import SQLExecutor
 from pg_mcp.services.sql_generator import SQLGenerator
@@ -50,7 +64,7 @@ class QueryOrchestrator:
         >>> orchestrator = QueryOrchestrator(
         ...     sql_generator=generator,
         ...     sql_validator=validator,
-        ...     sql_executor=executor,
+        ...     executors={"mydb": executor},
         ...     result_validator=result_validator,
         ...     schema_cache=cache,
         ...     pools={"mydb": pool},
@@ -67,33 +81,36 @@ class QueryOrchestrator:
         self,
         sql_generator: SQLGenerator,
         sql_validator: SQLValidator,
-        sql_executor: SQLExecutor,
+        executors: dict[str, SQLExecutor],
         result_validator: ResultValidator,
         schema_cache: SchemaCache,
         pools: dict[str, Pool],
         resilience_config: ResilienceConfig,
         validation_config: ValidationConfig,
+        rate_limiter: MultiRateLimiter | None = None,
     ) -> None:
         """Initialize query orchestrator.
 
         Args:
             sql_generator: SQL generation service.
             sql_validator: SQL validation service.
-            sql_executor: SQL execution service.
+            executors: Map of database name to its SQL execution service.
             result_validator: Result validation service.
             schema_cache: Schema cache instance.
             pools: Dictionary mapping database names to connection pools.
             resilience_config: Resilience configuration for retries and circuit breaker.
             validation_config: Validation configuration including thresholds.
+            rate_limiter: Optional rate limiter guarding LLM calls.
         """
         self.sql_generator = sql_generator
         self.sql_validator = sql_validator
-        self.sql_executor = sql_executor
+        self.executors = executors
         self.result_validator = result_validator
         self.schema_cache = schema_cache
         self.pools = pools
         self.resilience_config = resilience_config
         self.validation_config = validation_config
+        self.rate_limiter = rate_limiter
 
         # Create circuit breaker for LLM calls
         self.circuit_breaker = CircuitBreaker(
@@ -126,8 +143,13 @@ class QueryOrchestrator:
             >>> if response.success:
             ...     print(f"Found {response.data.row_count} rows")
         """
-        # Generate request_id for full-chain tracing
-        request_id = str(uuid.uuid4())
+        # Establish full-chain tracing: request_id is available via
+        # get_request_id() in any nested coroutine and in log formatters.
+        request_id = generate_request_id()
+        request_token = bind_request_id(request_id)
+        pipeline_started = time.monotonic()
+        request_status = "internal_error"
+        database_name: str | None = None
         logger.info(
             "Starting query execution",
             extra={"request_id": request_id, "question": request.question[:100]},
@@ -159,6 +181,10 @@ class QueryOrchestrator:
                         details={"database": database_name, "error": str(e)},
                     ) from e
 
+            cache_age = self.schema_cache.get_cache_age(database_name)
+            if cache_age is not None:
+                metrics.set_schema_cache_age(database_name, cache_age)
+
             logger.debug(
                 "Schema loaded",
                 extra={
@@ -169,10 +195,19 @@ class QueryOrchestrator:
             )
 
             # Step 3: Generate and validate SQL with retry logic
+            generation_started = time.monotonic()
             generated_sql, validation_result, tokens_used = await self._generate_sql_with_retry(
                 question=request.question,
                 schema=schema,
                 request_id=request_id,
+            )
+            logger.info(
+                "span completed",
+                extra={
+                    "request_id": request_id,
+                    "operation": "sql_generation",
+                    "duration_ms": round((time.monotonic() - generation_started) * 1000, 2),
+                },
             )
 
             # Step 4: If return_type is SQL, return early
@@ -181,40 +216,91 @@ class QueryOrchestrator:
                     "Returning SQL only",
                     extra={"request_id": request_id, "sql_length": len(generated_sql)},
                 )
+                request_status = "success"
                 return QueryResponse(
                     success=True,
+                    request_id=request_id,
                     generated_sql=generated_sql,
                     validation=validation_result,
                     data=None,
                     error=None,
                     confidence=100,
                     tokens_used=tokens_used,
+                    warning=None,
                 )
 
-            # Step 5: Execute SQL
+            # Step 5: Execute SQL on the resolved database's executor
             logger.debug("Executing SQL", extra={"request_id": request_id})
+            executor = self.executors.get(database_name)
+            if executor is None:
+                raise DatabaseConnectionError(
+                    message=f"Database '{database_name}' is not available",
+                    details={"database": database_name},
+                )
             start_time = self._get_current_time_ms()
 
-            results, total_count = await self.sql_executor.execute(generated_sql)
+            results, total_count = await executor.execute(generated_sql)
 
             execution_time_ms = self._get_current_time_ms() - start_time
+            with contextlib.suppress(Exception):  # pool stats are best-effort
+                metrics.set_db_connections_active(database_name, executor.pool.get_size())
             logger.info(
                 "SQL executed successfully",
                 extra={
                     "request_id": request_id,
+                    "operation": "sql_execution",
                     "row_count": total_count,
                     "execution_time_ms": execution_time_ms,
                 },
             )
 
             # Step 6: Validate results (non-blocking, failures don't fail the request)
-            result_confidence = await self._validate_results_safely(
+            validation_started = time.monotonic()
+            result_validation = await self._validate_results_safely(
                 question=request.question,
                 sql=generated_sql,
                 results=results,
                 row_count=total_count,
                 request_id=request_id,
             )
+            logger.info(
+                "span completed",
+                extra={
+                    "request_id": request_id,
+                    "operation": "result_validation",
+                    "duration_ms": round((time.monotonic() - validation_started) * 1000, 2),
+                },
+            )
+            if result_validation.tokens_used:
+                tokens_used = (tokens_used or 0) + result_validation.tokens_used
+
+            # Reject results the validator deemed unacceptable
+            if not result_validation.is_acceptable:
+                raise PgMcpError(
+                    message=(
+                        "Result confidence too low: "
+                        f"{result_validation.explanation}"
+                    ),
+                    code=ErrorCode.LOW_CONFIDENCE,
+                    details={
+                        "confidence": result_validation.confidence,
+                        "suggestion": result_validation.suggestion,
+                    },
+                )
+
+            confidence = result_validation.confidence
+            warning: str | None = None
+            if confidence < self.validation_config.min_confidence_score:
+                warning = (
+                    f"Low result confidence ({confidence}%): "
+                    f"{result_validation.explanation}"
+                )
+                if result_validation.suggestion:
+                    warning += f" Suggestion: {result_validation.suggestion}"
+                logger.warning(
+                    "Low result confidence",
+                    extra={"request_id": request_id, "confidence": confidence},
+                )
 
             # Step 7: Build successful response
             query_result = QueryResult(
@@ -224,18 +310,24 @@ class QueryOrchestrator:
                 execution_time_ms=execution_time_ms,
             )
 
+            request_status = "success"
             return QueryResponse(
                 success=True,
+                request_id=request_id,
                 generated_sql=generated_sql,
                 validation=validation_result,
                 data=query_result,
                 error=None,
-                confidence=result_confidence,
+                confidence=confidence,
                 tokens_used=tokens_used,
+                warning=warning,
             )
 
         except PgMcpError as e:
             # Handle known application errors
+            request_status = e.code.value
+            if isinstance(e, (SecurityViolationError, SQLParseError)):
+                metrics.increment_sql_rejected(e.code.value)
             logger.warning(
                 "Query execution failed with known error",
                 extra={
@@ -246,6 +338,7 @@ class QueryOrchestrator:
             )
             return QueryResponse(
                 success=False,
+                request_id=request_id,
                 generated_sql=None,
                 validation=None,
                 data=None,
@@ -256,6 +349,7 @@ class QueryOrchestrator:
                 ),
                 confidence=0,
                 tokens_used=None,
+                warning=None,
             )
         except Exception as e:
             # Handle unexpected errors
@@ -265,6 +359,7 @@ class QueryOrchestrator:
             )
             return QueryResponse(
                 success=False,
+                request_id=request_id,
                 generated_sql=None,
                 validation=None,
                 data=None,
@@ -275,7 +370,15 @@ class QueryOrchestrator:
                 ),
                 confidence=0,
                 tokens_used=None,
+                warning=None,
             )
+        finally:
+            # Request-level metrics: total duration + per-status counter
+            metrics.observe_query_duration(time.monotonic() - pipeline_started)
+            metrics.increment_query_request(
+                status=request_status, database=database_name or "unknown"
+            )
+            unbind_request_id(request_token)
 
     def _resolve_database(self, database: str | None) -> str:
         """Resolve database name from request or auto-select.
@@ -385,16 +488,16 @@ class QueryOrchestrator:
                     },
                 )
 
-                # Generate SQL
-                generated_sql = await self.sql_generator.generate(
-                    question=question,
-                    schema=schema,
-                    previous_attempt=previous_sql,
-                    error_feedback=error_feedback,
-                )
-
-                # Note: tokens_used would come from OpenAI response metadata if available
-                # For now, we don't extract it, but it can be added later
+                # Generate SQL (guarded by the LLM rate limiter when configured)
+                async with self._acquire_llm_slot():
+                    generated_sql, gen_tokens = await self.sql_generator.generate(
+                        question=question,
+                        schema=schema,
+                        previous_attempt=previous_sql,
+                        error_feedback=error_feedback,
+                    )
+                if gen_tokens:
+                    tokens_used = (tokens_used or 0) + gen_tokens
 
                 logger.debug(
                     "SQL generated",
@@ -420,6 +523,11 @@ class QueryOrchestrator:
                         )
                         previous_sql = generated_sql
                         error_feedback = str(validation_error)
+                        # Exponential backoff before the next generation attempt
+                        await asyncio.sleep(
+                            self.resilience_config.retry_delay
+                            * (self.resilience_config.backoff_factor**attempt)
+                        )
                         continue
                     else:
                         # Out of retries, record failure and raise
@@ -455,7 +563,7 @@ class QueryOrchestrator:
 
                 return generated_sql, validation_result, tokens_used
 
-            except (LLMError, SecurityViolationError, SQLParseError):
+            except (LLMError, SecurityViolationError, SQLParseError, RateLimitExceededError):
                 # Re-raise known errors
                 raise
             except Exception as e:
@@ -477,6 +585,35 @@ class QueryOrchestrator:
             details={"max_retries": max_retries},
         )
 
+    @asynccontextmanager
+    async def _acquire_llm_slot(self) -> AsyncIterator[None]:
+        """Acquire an LLM concurrency slot when a rate limiter is configured.
+
+        Raises:
+            RateLimitExceededError: If no slot became available within the
+                configured rate_limit_timeout.
+        """
+        if self.rate_limiter is None:
+            yield
+            return
+        try:
+            async with self.rate_limiter.for_llm(
+                timeout=self.resilience_config.rate_limit_timeout
+            ):
+                yield
+        except TimeoutError as e:
+            raise RateLimitExceededError(
+                message=(
+                    "Too many concurrent LLM calls, please retry later "
+                    f"(max_concurrent_llm_calls="
+                    f"{self.resilience_config.max_concurrent_llm_calls})"
+                ),
+                details={
+                    "max_concurrent_llm_calls": self.resilience_config.max_concurrent_llm_calls,
+                    "timeout_seconds": self.resilience_config.rate_limit_timeout,
+                },
+            ) from e
+
     async def _validate_results_safely(
         self,
         question: str,
@@ -484,11 +621,13 @@ class QueryOrchestrator:
         results: list[dict[str, Any]],
         row_count: int,
         request_id: str,
-    ) -> int:
+    ) -> ResultValidationResult:
         """Validate query results with error handling (non-blocking).
 
         This method attempts to validate results using LLM, but failures
-        don't cause the overall query to fail. Returns a confidence score.
+        don't cause the overall query to fail. Returns a validation result
+        with a synthetic high-confidence verdict when validation is
+        disabled or fails.
 
         Args:
             question: User's original question.
@@ -498,19 +637,27 @@ class QueryOrchestrator:
             request_id: Request ID for tracking.
 
         Returns:
-            int: Confidence score (0-100). Returns 100 if validation disabled/fails.
+            ResultValidationResult: Validation verdict (confidence 100 with
+                is_acceptable=True if validation disabled/fails).
 
         Example:
-            >>> confidence = await orchestrator._validate_results_safely(
+            >>> validation = await orchestrator._validate_results_safely(
             ...     question="Count users",
             ...     sql="SELECT COUNT(*) FROM users",
             ...     results=[{"count": 42}],
             ...     row_count=1,
             ...     request_id="123",
             ... )
+            >>> print(validation.confidence)
         """
         if not self.validation_config.enabled:
-            return 100
+            return ResultValidationResult(
+                confidence=100,
+                explanation="Result validation is disabled in configuration",
+                suggestion=None,
+                is_acceptable=True,
+                tokens_used=None,
+            )
 
         try:
             logger.debug(
@@ -518,12 +665,13 @@ class QueryOrchestrator:
                 extra={"request_id": request_id},
             )
 
-            validation_result = await self.result_validator.validate(
-                question=question,
-                sql=sql,
-                results=results,
-                row_count=row_count,
-            )
+            async with self._acquire_llm_slot():
+                validation_result = await self.result_validator.validate(
+                    question=question,
+                    sql=sql,
+                    results=results,
+                    row_count=row_count,
+                )
 
             logger.info(
                 "Result validation completed",
@@ -534,7 +682,7 @@ class QueryOrchestrator:
                 },
             )
 
-            return validation_result.confidence
+            return validation_result
 
         except Exception as e:
             # Log but don't fail the query
@@ -545,7 +693,14 @@ class QueryOrchestrator:
                     "error": str(e),
                 },
             )
-            return 100  # Default to high confidence if validation fails
+            # Default to high confidence if validation fails
+            return ResultValidationResult(
+                confidence=100,
+                explanation="Result validation failed; treating results as valid",
+                suggestion=None,
+                is_acceptable=True,
+                tokens_used=None,
+            )
 
     @staticmethod
     def _get_current_time_ms() -> float:

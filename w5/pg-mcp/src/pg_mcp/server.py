@@ -5,20 +5,23 @@ functionality as an MCP tool. It includes complete lifespan management for
 initializing and cleaning up all components.
 """
 
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
 from asyncpg import Pool
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from pg_mcp.cache.schema_cache import SchemaCache
 from pg_mcp.config.settings import Settings
-from pg_mcp.db.pool import close_pools, create_pool
+from pg_mcp.db.pool import close_pools, create_pools
+from pg_mcp.models.errors import ErrorCode
 from pg_mcp.models.query import QueryRequest, QueryResponse, ReturnType
 from pg_mcp.observability.logging import configure_logging, get_logger
 from pg_mcp.observability.metrics import MetricsCollector
-from pg_mcp.resilience.circuit_breaker import CircuitBreaker
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter
 from pg_mcp.services.orchestrator import QueryOrchestrator
 from pg_mcp.services.result_validator import ResultValidator
@@ -34,12 +37,12 @@ _pools: dict[str, Pool] | None = None
 _schema_cache: SchemaCache | None = None
 _orchestrator: QueryOrchestrator | None = None
 _metrics: MetricsCollector | None = None
-_circuit_breaker: CircuitBreaker | None = None
 _rate_limiter: MultiRateLimiter | None = None
+_started_at: float | None = None
 
 
 @asynccontextmanager
-async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-arg]
+async def lifespan(_app: FastMCP) -> AsyncIterator[None]:
     """Lifespan context manager for server initialization and cleanup.
 
     This function manages the complete lifecycle of the MCP server:
@@ -69,9 +72,10 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         ...     pass
     """
     global _settings, _pools, _schema_cache, _orchestrator, _metrics
-    global _circuit_breaker, _rate_limiter
+    global _rate_limiter, _started_at
 
     logger.info("Starting PostgreSQL MCP Server initialization...")
+    _started_at = time.monotonic()
 
     try:
         # 1. Load Settings
@@ -91,22 +95,22 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
             extra={
                 "environment": _settings.environment,
                 "log_level": _settings.observability.log_level,
+                "databases": [db.name for db in _settings.databases],
             },
         )
 
-        # 3. Create database connection pools
+        # 3. Create database connection pools (one per configured database)
         logger.info("Creating database connection pools...")
-        _pools = {}
-        # Note: For single database configuration, we use the main database config
-        pool = await create_pool(_settings.database)
-        _pools[_settings.database.name] = pool
-        logger.info(
-            f"Created connection pool for database '{_settings.database.name}'",
-            extra={
-                "min_size": _settings.database.min_pool_size,
-                "max_size": _settings.database.max_pool_size,
-            },
-        )
+        _pools = await create_pools(_settings.databases)
+        db_configs = {db.name: db for db in _settings.databases}
+        for db in _settings.databases:
+            logger.info(
+                f"Created connection pool for database '{db.name}'",
+                extra={
+                    "min_size": db.min_pool_size,
+                    "max_size": db.max_pool_size,
+                },
+            )
 
         # 4. Load Schema cache
         logger.info("Initializing schema cache...")
@@ -149,21 +153,22 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # SQL Generator
         sql_generator = SQLGenerator(_settings.openai)
 
-        # SQL Validator
+        # SQL Validator (security policy from configuration)
         sql_validator = SQLValidator(
             config=_settings.security,
-            blocked_tables=None,  # Can be configured via settings if needed
-            blocked_columns=None,  # Can be configured via settings if needed
-            allow_explain=False,
+            blocked_tables=_settings.security.blocked_tables,
+            blocked_columns=_settings.security.blocked_columns,
+            allow_explain=_settings.security.allow_explain,
         )
 
-        # SQL Executor (create one per database)
+        # SQL Executor (one per database, bound to that database's config)
         sql_executors: dict[str, SQLExecutor] = {}
         for db_name, pool in _pools.items():
             executor = SQLExecutor(
                 pool=pool,
                 security_config=_settings.security,
-                db_config=_settings.database,
+                db_config=db_configs[db_name],
+                resilience_config=_settings.resilience,
             )
             sql_executors[db_name] = executor
             logger.info(f"Created SQL executor for database '{db_name}'")
@@ -177,16 +182,11 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         # 7. Initialize resilience components
         logger.info("Initializing resilience components...")
 
-        # Circuit Breaker for LLM calls
-        _circuit_breaker = CircuitBreaker(
-            failure_threshold=_settings.resilience.circuit_breaker_threshold,
-            recovery_timeout=_settings.resilience.circuit_breaker_timeout,
-        )
-
-        # Rate Limiter
+        # Rate Limiter (concurrency limits from configuration; the LLM
+        # circuit breaker lives inside the orchestrator)
         _rate_limiter = MultiRateLimiter(
-            query_limit=10,  # Can be made configurable
-            llm_limit=5,  # Can be made configurable
+            query_limit=_settings.resilience.max_concurrent_queries,
+            llm_limit=_settings.resilience.max_concurrent_llm_calls,
         )
 
         # 8. Create QueryOrchestrator
@@ -194,12 +194,13 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
         _orchestrator = QueryOrchestrator(
             sql_generator=sql_generator,
             sql_validator=sql_validator,
-            sql_executor=sql_executors[_settings.database.name],  # Use primary executor
+            executors=sql_executors,
             result_validator=result_validator,
             schema_cache=_schema_cache,
             pools=_pools,
             resilience_config=_settings.resilience,
             validation_config=_settings.validation,
+            rate_limiter=_rate_limiter,
         )
 
         logger.info("PostgreSQL MCP Server initialization complete!")
@@ -228,7 +229,7 @@ async def lifespan(_app: FastMCP) -> AsyncIterator[None]:  # type: ignore[type-a
                     timeout=3.0
                 )
                 logger.info("Schema auto-refresh stopped")
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("Schema auto-refresh stop timed out")
             except Exception as e:
                 logger.warning(f"Error stopping schema auto-refresh: {e!s}")
@@ -335,6 +336,32 @@ async def query(
             },
         }
 
+    # Enforce the configured question length limit (ValidationConfig)
+    if _settings is None:
+        return {
+            "success": False,
+            "error": {
+                "code": "SERVER_NOT_INITIALIZED",
+                "message": "Server settings not initialized properly",
+                "details": None,
+            },
+        }
+    if len(question) > _settings.validation.max_question_length:
+        return {
+            "success": False,
+            "error": {
+                "code": ErrorCode.QUESTION_TOO_LONG.value,
+                "message": (
+                    f"Question exceeds maximum length of "
+                    f"{_settings.validation.max_question_length} characters"
+                ),
+                "details": {
+                    "question_length": len(question),
+                    "max_question_length": _settings.validation.max_question_length,
+                },
+            },
+        }
+
     # Build request
     try:
         request = QueryRequest(
@@ -352,14 +379,34 @@ async def query(
             },
         }
 
+    # Acquire a query concurrency slot before running the pipeline
+    query_slot_acquired = False
+    if _rate_limiter is not None:
+        query_slot_acquired = await _rate_limiter.query_limiter.acquire(
+            timeout=_settings.resilience.rate_limit_timeout
+        )
+        if not query_slot_acquired:
+            logger.warning(
+                "Query rejected: too many concurrent requests",
+                extra={
+                    "max_concurrent_queries": _settings.resilience.max_concurrent_queries,
+                },
+            )
+            return {
+                "success": False,
+                "error": {
+                    "code": ErrorCode.RATE_LIMIT_EXCEEDED.value,
+                    "message": "Too many concurrent queries, please retry later",
+                    "details": {
+                        "max_concurrent_queries": _settings.resilience.max_concurrent_queries,
+                    },
+                },
+            }
+
     # Execute query through orchestrator
     try:
         response: QueryResponse = await _orchestrator.execute_query(request)
-        result = response.to_dict()
-        # Ensure tokens_used is always present
-        if "tokens_used" not in result:
-            result["tokens_used"] = 0
-        return result
+        return response.to_dict()
     except Exception as e:
         logger.exception("Unexpected error in query tool")
         return {
@@ -369,8 +416,50 @@ async def query(
                 "message": f"Internal server error: {e!s}",
                 "details": {"error_type": type(e).__name__},
             },
-            "tokens_used": 0,
         }
+    finally:
+        if query_slot_acquired and _rate_limiter is not None:
+            _rate_limiter.query_limiter.release()
+
+
+@mcp.custom_route("/health", methods=["GET"])  # type: ignore[untyped-decorator]
+async def health_check(_request: Request) -> JSONResponse:
+    """HTTP health endpoint.
+
+    Reports per-database pool size, schema cache age, LLM circuit breaker
+    state, and uptime. Only reachable when the server runs with an HTTP or
+    SSE transport (stdio transport has no HTTP surface).
+
+    Args:
+        _request: Starlette request (unused).
+
+    Returns:
+        JSONResponse: Health summary.
+    """
+    databases: dict[str, Any] = {}
+    if _pools is not None:
+        for db_name, pool in _pools.items():
+            entry: dict[str, Any] = {"pool_size": pool.get_size()}
+            if _schema_cache is not None:
+                cache_age = _schema_cache.get_cache_age(db_name)
+                if cache_age is not None:
+                    entry["cache_age_seconds"] = round(cache_age, 1)
+            databases[db_name] = entry
+
+    return JSONResponse(
+        {
+            "status": "ok" if _orchestrator is not None else "initializing",
+            "databases": databases,
+            "circuit_breaker": (
+                _orchestrator.circuit_breaker.state.value
+                if _orchestrator is not None
+                else None
+            ),
+            "uptime_seconds": (
+                round(time.monotonic() - _started_at, 1) if _started_at else None
+            ),
+        }
+    )
 
 
 if __name__ == "__main__":

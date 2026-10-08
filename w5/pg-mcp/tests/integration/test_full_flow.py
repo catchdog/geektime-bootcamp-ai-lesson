@@ -2,11 +2,41 @@
 
 This module provides comprehensive integration tests that verify the complete
 query flow through all components of the system.
+
+These tests require a live PostgreSQL database and a real OpenAI API key.
+They are marked as ``integration`` and skipped automatically when the
+required environment is not configured, so the default unit suite
+(``pytest -m "not integration"``) stays green without external services.
 """
+
+import os
 
 import pytest
 
 from pg_mcp.server import lifespan, mcp, query
+
+
+def _live_services_available() -> bool:
+    """Whether a reachable PostgreSQL and an OpenAI key are configured."""
+    has_openai = bool(os.environ.get("OPENAI_API_KEY", "").startswith("sk-"))
+    has_db = bool(
+        os.environ.get("DATABASE_HOST")
+        or os.environ.get("DATABASE_NAME")
+        or os.environ.get("DATABASES")
+    )
+    return has_openai and has_db
+
+
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(
+        not _live_services_available(),
+        reason=(
+            "requires live PostgreSQL and OpenAI credentials "
+            "(set DATABASE_*/DATABASES and OPENAI_API_KEY)"
+        ),
+    ),
+]
 
 
 class TestFullQueryFlow:
@@ -29,18 +59,13 @@ class TestFullQueryFlow:
                 return_type="result",
             )
 
-            # Verify response structure
-            assert isinstance(result, dict)
-            assert "success" in result
-
-            # If successful, verify data structure
-            if result.get("success"):
-                assert "data" in result
-                assert result["data"] is not None
-                assert "rows" in result["data"]
-                assert "columns" in result["data"]
-                assert "row_count" in result["data"]
-                assert result["data"]["row_count"] >= 0
+            # With live services the full flow must succeed
+            assert result["success"] is True, f"unexpected error: {result.get('error')}"
+            assert result["data"] is not None
+            assert "rows" in result["data"]
+            assert "columns" in result["data"]
+            assert "row_count" in result["data"]
+            assert result["data"]["row_count"] >= 0
 
     @pytest.mark.asyncio
     async def test_query_with_validation(self):
@@ -58,19 +83,12 @@ class TestFullQueryFlow:
                 return_type="result",
             )
 
-            # Verify response structure
-            assert isinstance(result, dict)
-
-            # If successful, check for validation metadata
-            if result.get("success"):
-                # Confidence score should be present
-                assert "confidence" in result
-                assert isinstance(result["confidence"], int)
-                assert 0 <= result["confidence"] <= 100
-
-                # Generated SQL should be present
-                assert "generated_sql" in result
-                assert isinstance(result["generated_sql"], str)
+            # With live services the full flow must succeed
+            assert result["success"] is True, f"unexpected error: {result.get('error')}"
+            # Confidence score should be present
+            assert "confidence" in result
+            assert isinstance(result["confidence"], int)
+            assert 0 <= result["confidence"] <= 100
 
     @pytest.mark.asyncio
     async def test_sql_only_mode(self):
@@ -88,19 +106,13 @@ class TestFullQueryFlow:
                 return_type="sql",
             )
 
-            # Verify response structure
-            assert isinstance(result, dict)
-            assert "success" in result
-
-            # If successful, verify SQL-only response
-            if result.get("success"):
-                # Should have generated SQL
-                assert "generated_sql" in result
-                assert isinstance(result["generated_sql"], str)
-                assert len(result["generated_sql"]) > 0
-
-                # Should NOT have execution data
-                assert "data" not in result or result["data"] is None
+            # With live services the SQL-only path must succeed
+            assert result["success"] is True, f"unexpected error: {result.get('error')}"
+            # Should have generated SQL and no execution data
+            assert "generated_sql" in result
+            assert isinstance(result["generated_sql"], str)
+            assert len(result["generated_sql"]) > 0
+            assert result.get("data") is None
 
     @pytest.mark.asyncio
     async def test_multi_database_selection(self):

@@ -7,6 +7,7 @@ repeated introspection queries and improve performance.
 import asyncio
 import contextlib
 import logging
+from collections import OrderedDict
 from datetime import UTC, datetime
 
 from asyncpg import Pool
@@ -41,8 +42,9 @@ class SchemaCache:
             config: Cache configuration with TTL and size limits.
         """
         self.config = config
-        self._cache: dict[str, DatabaseSchema] = {}
-        self._cache_timestamps: dict[str, datetime] = {}
+        # LRU-ordered by most recently used (end = newest); bounded by max_size
+        self._cache: OrderedDict[str, DatabaseSchema] = OrderedDict()
+        self._cache_timestamps: OrderedDict[str, datetime] = OrderedDict()
         self._refresh_task: asyncio.Task[None] | None = None
         self._stop_refresh = False
 
@@ -75,6 +77,8 @@ class SchemaCache:
             self._cache_timestamps.pop(database_name, None)
             return None
 
+        # Mark as most recently used
+        self._cache.move_to_end(database_name)
         return self._cache[database_name]
 
     async def load(
@@ -106,9 +110,21 @@ class SchemaCache:
 
         if self.config.enabled:
             self._cache[database_name] = schema
+            self._cache.move_to_end(database_name)
             self._cache_timestamps[database_name] = datetime.now(UTC)
+            self._evict_overflow()
 
         return schema
+
+    def _evict_overflow(self) -> None:
+        """Evict least-recently-used entries when the cache exceeds max_size."""
+        while len(self._cache) > self.config.max_size:
+            evicted_name, _ = self._cache.popitem(last=False)
+            self._cache_timestamps.pop(evicted_name, None)
+            logger.debug(
+                "Evicted schema from cache (max_size reached)",
+                extra={"database": evicted_name},
+            )
 
     async def refresh(
         self,

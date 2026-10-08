@@ -11,6 +11,8 @@ from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
+from pg_mcp.observability.tracing import get_request_id
+
 
 class LogRecord(BaseModel):
     """Structured log record model.
@@ -153,9 +155,13 @@ class JSONFormatter(logging.Formatter):
             "line": record.lineno,
         }
 
-        # Add request_id if present
+        # Add request_id if present (record extra wins, else tracing context)
         if hasattr(record, "request_id"):
             log_data["request_id"] = record.request_id
+        else:
+            context_request_id = get_request_id()
+            if context_request_id:
+                log_data["request_id"] = context_request_id
 
         # Add exception info if present
         if record.exc_info:
@@ -224,9 +230,13 @@ class TextFormatter(logging.Formatter):
             f"{record.getMessage()}"
         )
 
-        # Add request_id if present
+        # Add request_id if present (record extra wins, else tracing context)
         if hasattr(record, "request_id"):
             formatted += f" [request_id={record.request_id}]"
+        else:
+            context_request_id = get_request_id()
+            if context_request_id:
+                formatted += f" [request_id={context_request_id}]"
 
         # Add exception if present
         if record.exc_info:

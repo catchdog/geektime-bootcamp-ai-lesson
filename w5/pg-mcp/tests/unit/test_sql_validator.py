@@ -154,7 +154,7 @@ class TestRejectedStatements:
     @pytest.fixture
     def validator(self) -> SQLValidator:
         """Create validator for testing rejected statements."""
-        config = SecurityConfig(allow_write_operations=False)
+        config = SecurityConfig()
         return SQLValidator(config=config)
 
     def test_insert_rejected(self, validator: SQLValidator) -> None:
@@ -476,15 +476,38 @@ class TestExplainStatements:
         assert is_valid
         assert error is None
 
-    def test_explain_analyze_allowed(self) -> None:
-        """Test EXPLAIN ANALYZE is allowed when EXPLAIN is enabled."""
+    def test_explain_analyze_always_rejected(self) -> None:
+        """Test EXPLAIN ANALYZE stays blocked even when EXPLAIN is allowed.
+
+        EXPLAIN ANALYZE actually executes the inner statement to produce
+        real timings, so it must never pass validation.
+        """
         config = SecurityConfig()
         validator = SQLValidator(config=config, allow_explain=True)
 
         sql = "EXPLAIN ANALYZE SELECT * FROM users WHERE id > 100"
-        is_valid, error = validator.validate(sql)
-        assert is_valid
-        assert error is None
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "analyze" in str(exc_info.value).lower()
+
+    def test_explain_analyze_spelling_rejected(self) -> None:
+        """Test the ANALYSE spelling is blocked as well."""
+        config = SecurityConfig()
+        validator = SQLValidator(config=config, allow_explain=True)
+
+        sql = "EXPLAIN ANALYSE SELECT * FROM users"
+        with pytest.raises(SecurityViolationError):
+            validator.validate_or_raise(sql)
+
+    def test_explain_blocked_by_default_even_when_policy_set(self) -> None:
+        """Test EXPLAIN is rejected when the config does not allow it."""
+        config = SecurityConfig(allow_explain=False)
+        validator = SQLValidator(config=config, allow_explain=config.allow_explain)
+
+        sql = "EXPLAIN SELECT * FROM users"
+        with pytest.raises(SecurityViolationError) as exc_info:
+            validator.validate_or_raise(sql)
+        assert "explain" in str(exc_info.value).lower()
 
     def test_explain_with_dangerous_query_allowed(self) -> None:
         """Test EXPLAIN with dangerous underlying query is allowed.

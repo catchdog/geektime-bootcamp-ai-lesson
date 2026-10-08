@@ -7,7 +7,7 @@ sensible defaults.
 
 from typing import Literal
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -31,16 +31,6 @@ class DatabaseConfig(BaseSettings):
     command_timeout: float = Field(
         default=30.0, ge=1.0, le=300.0, description="Command execution timeout in seconds"
     )
-
-    @property
-    def dsn(self) -> str:
-        """Build PostgreSQL DSN connection string."""
-        return f"postgresql://{self.user}:{self.password}@{self.host}:{self.port}/{self.name}"
-
-    @property
-    def safe_dsn(self) -> str:
-        """Build DSN with masked password for logging."""
-        return f"postgresql://{self.user}:***@{self.host}:{self.port}/{self.name}"
 
 
 class OpenAIConfig(BaseSettings):
@@ -75,8 +65,17 @@ class SecurityConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="SECURITY_")
 
-    allow_write_operations: bool = Field(
-        default=False, description="Allow write operations (INSERT, UPDATE, DELETE)"
+    blocked_tables: list[str] = Field(
+        default_factory=list,
+        description="Tables that queries must not access (bare name or schema.table)",
+    )
+    blocked_columns: list[str] = Field(
+        default_factory=list,
+        description="Columns that queries must not access (bare name or table.column)",
+    )
+    allow_explain: bool = Field(
+        default=False,
+        description="Allow plain EXPLAIN statements (EXPLAIN ANALYZE is always blocked)",
     )
     blocked_functions: list[str] = Field(
         default_factory=lambda: [
@@ -99,9 +98,9 @@ class SecurityConfig(BaseSettings):
         default="public", description="Safe search_path to set during query execution"
     )
 
-    @field_validator("blocked_functions", mode="before")
+    @field_validator("blocked_functions", "blocked_tables", "blocked_columns", mode="before")
     @classmethod
-    def parse_blocked_functions(cls, v: str | list[str]) -> list[str]:
+    def parse_string_list(cls, v: str | list[str]) -> list[str]:
         """Parse comma-separated string or list."""
         if isinstance(v, str):
             return [f.strip() for f in v.split(",") if f.strip()]
@@ -157,6 +156,20 @@ class ResilienceConfig(BaseSettings):
     backoff_factor: float = Field(
         default=2.0, ge=1.0, le=10.0, description="Exponential backoff factor"
     )
+    max_concurrent_queries: int = Field(
+        default=10, ge=1, le=1000, description="Maximum concurrent query executions"
+    )
+    max_concurrent_llm_calls: int = Field(
+        default=5, ge=1, le=100, description="Maximum concurrent LLM API calls"
+    )
+    rate_limit_timeout: float = Field(
+        default=5.0, ge=0.0, le=60.0,
+        description="Seconds to wait for a rate limiter slot before returning RATE_LIMITED",
+    )
+    db_retry_attempts: int = Field(
+        default=3, ge=0, le=10,
+        description="Retries for transient database errors (exponential backoff)",
+    )
     circuit_breaker_threshold: int = Field(
         default=5, ge=1, le=100, description="Failures before circuit opens"
     )
@@ -196,6 +209,13 @@ class Settings(BaseSettings):
 
     # Nested configurations
     database: DatabaseConfig = Field(default_factory=DatabaseConfig)
+    databases: list[DatabaseConfig] = Field(
+        default_factory=list,
+        description=(
+            "Databases available for querying (JSON list). "
+            "Falls back to [database] when not set."
+        ),
+    )
     openai: OpenAIConfig = Field(default_factory=OpenAIConfig)
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     validation: ValidationConfig = Field(default_factory=ValidationConfig)
@@ -203,15 +223,24 @@ class Settings(BaseSettings):
     resilience: ResilienceConfig = Field(default_factory=ResilienceConfig)
     observability: ObservabilityConfig = Field(default_factory=ObservabilityConfig)
 
-    @property
-    def is_production(self) -> bool:
-        """Check if running in production environment."""
-        return self.environment == "production"
+    @model_validator(mode="after")
+    def resolve_databases(self) -> "Settings":
+        """Resolve the effective database list.
 
-    @property
-    def is_development(self) -> bool:
-        """Check if running in development environment."""
-        return self.environment == "development"
+        When DATABASES is not set, fall back to the single legacy
+        DATABASE_* configuration so single-database setups keep working.
+
+        Raises:
+            ValueError: If database names are not unique.
+        """
+        if not self.databases:
+            self.databases = [self.database]
+
+        names = [db.name for db in self.databases]
+        if len(names) != len(set(names)):
+            duplicates = sorted({n for n in names if names.count(n) > 1})
+            raise ValueError(f"Database names must be unique, duplicates: {duplicates}")
+        return self
 
 
 # Global settings instance

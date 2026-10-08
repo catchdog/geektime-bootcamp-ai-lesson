@@ -12,6 +12,8 @@ dependencies = [
     "openai>=2.14.0",
     "prometheus-client>=0.23.0",
     "fastmcp>=2.14.1",
+    # Direct import target (mcp.server.fastmcp was removed in mcp 2.x)
+    "mcp>=1.6,<2",
 ]
 
 [project.optional-dependencies]

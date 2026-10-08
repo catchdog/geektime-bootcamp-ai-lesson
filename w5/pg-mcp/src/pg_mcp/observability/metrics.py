@@ -124,6 +124,14 @@ class MetricsCollector:
         """
         self.query_requests.labels(status=status, database=database).inc()
 
+    def observe_query_duration(self, duration: float) -> None:
+        """Record end-to-end query request duration.
+
+        Args:
+            duration: Duration in seconds.
+        """
+        self.query_duration.observe(duration)
+
     def increment_llm_call(self, operation: str) -> None:
         """Increment LLM call counter.
 

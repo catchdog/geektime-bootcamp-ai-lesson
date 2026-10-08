@@ -5,12 +5,14 @@ natural language questions into valid PostgreSQL SQL queries.
 """
 
 import re
+import time
 from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
 
 from pg_mcp.config.settings import OpenAIConfig
 from pg_mcp.models.errors import LLMError, LLMTimeoutError, LLMUnavailableError
+from pg_mcp.observability.metrics import metrics
 from pg_mcp.prompts.sql_generation import SQL_GENERATION_SYSTEM_PROMPT, build_user_prompt
 
 if TYPE_CHECKING:
@@ -51,7 +53,7 @@ class SQLGenerator:
         context: str | None = None,
         previous_attempt: str | None = None,
         error_feedback: str | None = None,
-    ) -> str:
+    ) -> tuple[str, int | None]:
         """Generate SQL statement from natural language question.
 
         This method sends the question and database schema to OpenAI's API
@@ -66,7 +68,8 @@ class SQLGenerator:
             error_feedback: Error message from previous attempt (for retry).
 
         Returns:
-            str: Generated SQL query (without trailing semicolon).
+            tuple[str, int | None]: (generated SQL query without trailing
+                semicolon, LLM tokens used by this call or None).
 
         Raises:
             LLMError: If generation fails or response is invalid.
@@ -75,12 +78,12 @@ class SQLGenerator:
 
         Example:
             >>> # Initial generation
-            >>> sql = await generator.generate(
+            >>> sql, tokens = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema
             ... )
             >>> # Retry with error feedback
-            >>> sql = await generator.generate(
+            >>> sql, tokens = await generator.generate(
             ...     question="Count all active users",
             ...     schema=db_schema,
             ...     previous_attempt="SELECT COUNT(*) FROM user",
@@ -95,6 +98,8 @@ class SQLGenerator:
             error_feedback=error_feedback,
         )
 
+        metrics.increment_llm_call("generate_sql")
+        start_time = time.monotonic()
         try:
             response: ChatCompletion = await self.client.chat.completions.create(
                 model=self.config.model,
@@ -127,6 +132,12 @@ class SQLGenerator:
                 message=f"OpenAI API request failed: {error_msg}",
                 details={"error": error_msg},
             ) from e
+        finally:
+            metrics.observe_llm_latency("generate_sql", time.monotonic() - start_time)
+
+        tokens_used = response.usage.total_tokens if response.usage else None
+        if tokens_used:
+            metrics.increment_llm_tokens("generate_sql", tokens_used)
 
         # Extract SQL from response
         if not response.choices:
@@ -149,7 +160,7 @@ class SQLGenerator:
                 details={"content": content},
             )
 
-        return sql
+        return sql, tokens_used
 
     def _extract_sql(self, content: str) -> str | None:
         """Extract SQL query from LLM response content.
@@ -184,7 +195,7 @@ class SQLGenerator:
         matches = re.findall(code_block_pattern, content, re.DOTALL | re.IGNORECASE)
 
         if matches:
-            sql = matches[0].strip()
+            sql = str(matches[0].strip())
             # Remove trailing semicolon for consistency
             return sql.rstrip(";") + ";"
 
@@ -193,7 +204,7 @@ class SQLGenerator:
         matches = re.findall(sql_pattern, content, re.DOTALL | re.IGNORECASE)
 
         if matches:
-            sql = matches[0].strip()
+            sql = str(matches[0].strip())
             return sql.rstrip(";") + ";"
 
         # Strategy 3: Check if entire content looks like SQL

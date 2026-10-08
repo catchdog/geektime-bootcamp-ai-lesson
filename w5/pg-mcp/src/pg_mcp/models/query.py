@@ -100,6 +100,9 @@ class ResultValidationResult(BaseModel):
     is_acceptable: bool = Field(
         ..., description="Whether results are acceptable based on confidence threshold"
     )
+    tokens_used: int | None = Field(
+        None, ge=0, description="LLM tokens used by this validation call"
+    )
 
 
 class QueryResult(BaseModel):
@@ -143,11 +146,23 @@ class ErrorDetail(BaseModel):
     message: str = Field(..., description="Human-readable error message")
     details: dict[str, Any] | None = Field(None, description="Additional error context")
 
+    def to_dict(self) -> dict[str, Any]:
+        """Convert to dictionary representation.
+
+        Returns:
+            dict: Dictionary containing error information.
+        """
+        result: dict[str, Any] = {"code": self.code, "message": self.message}
+        if self.details:
+            result["details"] = self.details
+        return result
+
 
 class QueryResponse(BaseModel):
     """Complete query response to client."""
 
     success: bool = Field(..., description="Whether query succeeded")
+    request_id: str | None = Field(None, description="Request correlation ID")
     generated_sql: str | None = Field(None, description="Generated SQL query")
     validation: ValidationResult | None = Field(None, description="SQL validation results")
     data: QueryResult | None = Field(None, description="Query result data (if executed)")
@@ -156,21 +171,9 @@ class QueryResponse(BaseModel):
         default=100, ge=0, le=100, description="Confidence score of generated SQL (0-100)"
     )
     tokens_used: int | None = Field(None, ge=0, description="LLM tokens used for generation")
-
-    def to_dict(self) -> dict[str, Any]:
-        """Convert response to dictionary for MCP tool return.
-
-        Returns:
-            dict: Dictionary representation compatible with MCP protocol.
-        """
-        # Use model_dump but ensure tokens_used is always present
-        result = self.model_dump(exclude_none=False)
-
-        # Ensure tokens_used is always present (use 0 if None)
-        if result.get("tokens_used") is None:
-            result["tokens_used"] = 0
-
-        return result
+    warning: str | None = Field(
+        None, description="Warning message (e.g. low result confidence)"
+    )
 
     @field_validator("data")
     @classmethod

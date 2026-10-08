@@ -2,10 +2,12 @@
 
 from pg_mcp.resilience.circuit_breaker import CircuitBreaker, CircuitState
 from pg_mcp.resilience.rate_limiter import MultiRateLimiter, RateLimiter
+from pg_mcp.resilience.retry import async_retry
 
 __all__ = [
     "CircuitBreaker",
     "CircuitState",
     "RateLimiter",
     "MultiRateLimiter",
+    "async_retry",
 ]

@@ -51,32 +51,6 @@ class TestDatabaseConfig:
         assert config.user == "myuser"
         assert config.password == "secret"
 
-    def test_dsn_generation(self) -> None:
-        """Test DSN string generation."""
-        config = DatabaseConfig(
-            host="localhost",
-            port=5432,
-            name="testdb",
-            user="testuser",
-            password="testpass",
-        )
-        dsn = config.dsn
-        assert dsn == "postgresql://testuser:testpass@localhost:5432/testdb"
-
-    def test_safe_dsn_masks_password(self) -> None:
-        """Test safe DSN masks password."""
-        config = DatabaseConfig(
-            host="localhost",
-            port=5432,
-            name="testdb",
-            user="testuser",
-            password="secret123",
-        )
-        safe_dsn = config.safe_dsn
-        assert "secret123" not in safe_dsn
-        assert "***" in safe_dsn
-        assert "testuser" in safe_dsn
-
     def test_invalid_port(self) -> None:
         """Test invalid port number is rejected."""
         with pytest.raises(ValidationError):
@@ -157,11 +131,33 @@ class TestSecurityConfig:
     def test_default_values(self) -> None:
         """Test default configuration values."""
         config = SecurityConfig()
-        assert config.allow_write_operations is False
+        assert config.blocked_tables == []
+        assert config.blocked_columns == []
+        assert config.allow_explain is False
         assert config.max_rows == 10000
         assert config.max_execution_time == 30.0
         assert "pg_sleep" in config.blocked_functions
         assert "pg_read_file" in config.blocked_functions
+
+    def test_blocked_resources(self) -> None:
+        """Test blocked tables/columns and EXPLAIN policy."""
+        config = SecurityConfig(
+            blocked_tables=["secret_data", "users.passwords"],
+            blocked_columns=["password_hash", "users.api_key"],
+            allow_explain=True,
+        )
+        assert config.blocked_tables == ["secret_data", "users.passwords"]
+        assert config.blocked_columns == ["password_hash", "users.api_key"]
+        assert config.allow_explain is True
+
+    def test_parse_blocked_lists_from_string(self) -> None:
+        """Test parsing blocked tables/columns from comma-separated string."""
+        config = SecurityConfig(
+            blocked_tables="t1, t2",  # type: ignore
+            blocked_columns="c1, c2",  # type: ignore
+        )
+        assert config.blocked_tables == ["t1", "t2"]
+        assert config.blocked_columns == ["c1", "c2"]
 
     def test_custom_blocked_functions(self) -> None:
         """Test custom blocked functions."""
@@ -178,11 +174,6 @@ class TestSecurityConfig:
         assert "func1" in config.blocked_functions
         assert "func2" in config.blocked_functions
         assert "func3" in config.blocked_functions
-
-    def test_allow_write_operations(self) -> None:
-        """Test enabling write operations."""
-        config = SecurityConfig(allow_write_operations=True)
-        assert config.allow_write_operations is True
 
     def test_invalid_max_rows(self) -> None:
         """Test invalid max_rows is rejected."""
@@ -259,6 +250,10 @@ class TestResilienceConfig:
         assert config.max_retries == 3
         assert config.retry_delay == 1.0
         assert config.backoff_factor == 2.0
+        assert config.max_concurrent_queries == 10
+        assert config.max_concurrent_llm_calls == 5
+        assert config.rate_limit_timeout == 5.0
+        assert config.db_retry_attempts == 3
         assert config.circuit_breaker_threshold == 5
         assert config.circuit_breaker_timeout == 60.0
 
@@ -268,10 +263,18 @@ class TestResilienceConfig:
             max_retries=5,
             retry_delay=2.0,
             backoff_factor=3.0,
+            max_concurrent_queries=20,
+            max_concurrent_llm_calls=8,
+            rate_limit_timeout=2.5,
+            db_retry_attempts=1,
         )
         assert config.max_retries == 5
         assert config.retry_delay == 2.0
         assert config.backoff_factor == 3.0
+        assert config.max_concurrent_queries == 20
+        assert config.max_concurrent_llm_calls == 8
+        assert config.rate_limit_timeout == 2.5
+        assert config.db_retry_attempts == 1
 
     def test_invalid_values(self) -> None:
         """Test invalid values are rejected."""
@@ -280,6 +283,12 @@ class TestResilienceConfig:
 
         with pytest.raises(ValidationError):
             ResilienceConfig(backoff_factor=0.5)
+
+        with pytest.raises(ValidationError):
+            ResilienceConfig(max_concurrent_queries=0)
+
+        with pytest.raises(ValidationError):
+            ResilienceConfig(db_retry_attempts=-1)
 
 
 class TestObservabilityConfig:
@@ -292,7 +301,7 @@ class TestObservabilityConfig:
         # 生产环境应该通过环境变量显式设置
         assert config.metrics_port == 9090
         assert config.log_level == "INFO"
-        assert config.log_format == "json"
+        assert config.log_format == "text"
 
     def test_custom_values(self) -> None:
         """Test custom configuration values."""
@@ -326,30 +335,13 @@ class TestSettings:
         settings = Settings(openai=OpenAIConfig(api_key="sk-test"))
         assert settings.environment == "development"
         assert settings.database is not None
+        assert settings.databases == [settings.database]
         assert settings.openai is not None
         assert settings.security is not None
         assert settings.validation is not None
         assert settings.cache is not None
         assert settings.resilience is not None
         assert settings.observability is not None
-
-    def test_is_production(self) -> None:
-        """Test production environment check."""
-        settings = Settings(
-            environment="production",
-            openai=OpenAIConfig(api_key="sk-test"),
-        )
-        assert settings.is_production
-        assert not settings.is_development
-
-    def test_is_development(self) -> None:
-        """Test development environment check."""
-        settings = Settings(
-            environment="development",
-            openai=OpenAIConfig(api_key="sk-test"),
-        )
-        assert settings.is_development
-        assert not settings.is_production
 
     def test_nested_config_override(self) -> None:
         """Test overriding nested configurations."""
@@ -360,12 +352,67 @@ class TestSettings:
                 port=5433,
             ),
             security=SecurityConfig(
-                allow_write_operations=True,
+                blocked_tables=["secret_data"],
             ),
         )
         assert settings.database.host == "custom.host"
         assert settings.database.port == 5433
-        assert settings.security.allow_write_operations is True
+        assert settings.security.blocked_tables == ["secret_data"]
+
+
+class TestMultiDatabaseSettings:
+    """Tests for multi-database configuration."""
+
+    def test_fallback_to_single_database(self) -> None:
+        """Test databases falls back to [database] when DATABASES unset."""
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            database=DatabaseConfig(name="legacy_db", host="legacy.host"),
+        )
+        assert len(settings.databases) == 1
+        assert settings.databases[0].name == "legacy_db"
+        assert settings.databases[0].host == "legacy.host"
+
+    def test_multiple_databases_from_list(self) -> None:
+        """Test explicit multi-database configuration."""
+        settings = Settings(
+            openai=OpenAIConfig(api_key="sk-test"),
+            databases=[
+                DatabaseConfig(name="db_a", host="host.a"),
+                DatabaseConfig(name="db_b", host="host.b"),
+            ],
+        )
+        assert [db.name for db in settings.databases] == ["db_a", "db_b"]
+        assert settings.databases[0].host == "host.a"
+        assert settings.databases[1].host == "host.b"
+
+    def test_databases_from_env_json(self) -> None:
+        """Test DATABASES environment variable JSON parsing."""
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        os.environ["DATABASES"] = (
+            '[{"name":"prod","host":"p.host","password":"x"},'
+            '{"name":"analytics","host":"a.host","password":"y"}]'
+        )
+        try:
+            reset_settings()
+            settings = get_settings()
+            assert [db.name for db in settings.databases] == ["prod", "analytics"]
+            assert settings.databases[0].host == "p.host"
+            assert settings.databases[1].host == "a.host"
+        finally:
+            os.environ.pop("DATABASES", None)
+            reset_settings()
+
+    def test_duplicate_database_names_rejected(self) -> None:
+        """Test duplicate database names are rejected."""
+        with pytest.raises(ValidationError, match="unique"):
+            Settings(
+                openai=OpenAIConfig(api_key="sk-test"),
+                databases=[
+                    DatabaseConfig(name="db_a"),
+                    DatabaseConfig(name="db_a"),
+                ],
+            )
 
 
 class TestSettingsGlobalInstance:

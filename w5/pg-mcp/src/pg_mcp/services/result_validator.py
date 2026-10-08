@@ -5,6 +5,7 @@ whether query results correctly match the user's original question.
 """
 
 import json
+import time
 from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI
@@ -12,6 +13,7 @@ from openai import AsyncOpenAI
 from pg_mcp.config.settings import OpenAIConfig, ValidationConfig
 from pg_mcp.models.errors import LLMError, LLMTimeoutError, LLMUnavailableError
 from pg_mcp.models.query import ResultValidationResult
+from pg_mcp.observability.metrics import metrics
 from pg_mcp.prompts.result_validation import (
     RESULT_VALIDATION_SYSTEM_PROMPT,
     build_validation_prompt,
@@ -103,6 +105,7 @@ class ResultValidator:
                 explanation="Validation is disabled in configuration",
                 suggestion=None,
                 is_acceptable=True,
+                tokens_used=None,
             )
 
         # Sample results to avoid sending too much data to LLM
@@ -118,6 +121,8 @@ class ResultValidator:
 
         try:
             # Call OpenAI API with structured JSON output
+            metrics.increment_llm_call("validate_result")
+            start_time = time.monotonic()
             response: ChatCompletion = await self.client.chat.completions.create(
                 model=self.openai_config.model,
                 messages=[
@@ -128,6 +133,11 @@ class ResultValidator:
                 temperature=0.0,  # Use deterministic output for validation
                 response_format={"type": "json_object"},  # Ensure JSON response
             )
+            metrics.observe_llm_latency("validate_result", time.monotonic() - start_time)
+
+            tokens_used = response.usage.total_tokens if response.usage else None
+            if tokens_used:
+                metrics.increment_llm_tokens("validate_result", tokens_used)
 
             # Extract and parse the response
             if not response.choices:
@@ -153,6 +163,7 @@ class ResultValidator:
                     explanation=f"Validation response parsing failed: {e!s}",
                     suggestion="Unable to parse LLM response, manual verification recommended",
                     is_acceptable=False,
+                    tokens_used=None,
                 )
 
             # Extract fields from response
@@ -176,6 +187,7 @@ class ResultValidator:
                 explanation=explanation,
                 suggestion=suggestion,
                 is_acceptable=is_acceptable,
+                tokens_used=tokens_used,
             )
 
         except TimeoutError as e:
@@ -191,6 +203,7 @@ class ResultValidator:
                 explanation=f"JSON parsing error: {e!s}",
                 suggestion=None,
                 is_acceptable=False,
+                tokens_used=None,
             )
         except LLMError:
             # Re-raise LLM errors as-is
